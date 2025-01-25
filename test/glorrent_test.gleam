@@ -1,6 +1,9 @@
 import gleam/bit_array
 import gleam/dict
+import gleam/int
+import gleam/io
 import gleam/list
+import gleam/string
 import gleeunit
 import gleeunit/should
 import simplifile
@@ -121,4 +124,27 @@ pub fn void_torrent_file_test() {
   let encoded = torrent.to_bencode(decoded) |> bencode.encode
 
   should.equal(content, encoded)
+}
+
+pub fn void_piece_map_test() {
+  let path = "./test/void-linux.torrent"
+
+  let assert Ok(content) = simplifile.read_bits(path)
+  let assert Ok(bencode) = bencode.decode(content)
+  let assert Ok(torrent) = torrent.from_bencode(bencode)
+
+  let piece_map = torrent.piece_map(torrent.info)
+
+  let uneven_pieces =
+    dict.to_list(piece_map)
+    |> list.filter_map(fn(entry) {
+      let #(i, piece) = entry
+      case piece.length == 524_288 {
+        True -> Error(Nil)
+        False -> Ok(#(i, piece))
+      }
+    })
+
+  should.equal(1526, piece_map |> dict.size)
+  should.equal([], uneven_pieces)
 }

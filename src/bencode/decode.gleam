@@ -18,6 +18,12 @@ pub fn success(data: t) -> Decoder(t) {
   Decoder(function: fn(_) { #(data, []) })
 }
 
+pub fn failure(zero: a, expected: String) -> Decoder(a) {
+  Decoder(function: fn(d) {
+    #(zero, [DecodeError(expected, bencode.classify(d))])
+  })
+}
+
 pub const int: Decoder(Int) = Decoder(decode_int)
 
 fn decode_int(value: Value) -> #(Int, List(DecodeError)) {
@@ -158,6 +164,18 @@ pub fn optional(inner: Decoder(t)) -> Decoder(option.Option(t)) {
     case errors {
       [] -> #(option.Some(decoded), [])
       _ -> #(option.None, [])
+    }
+  })
+}
+
+pub fn then(first: Decoder(t), do f: fn(t) -> Decoder(final)) -> Decoder(final) {
+  Decoder(function: fn(value) {
+    let #(data, errors) = first.function(value)
+    let decoder = f(data)
+    let #(data, _) as layer = decoder.function(value)
+    case errors {
+      [] -> layer
+      _ -> #(data, errors)
     }
   })
 }
