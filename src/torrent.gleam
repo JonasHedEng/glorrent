@@ -3,10 +3,16 @@ import gleam/crypto
 import gleam/dict
 import gleam/int
 import gleam/list
-import gleam/string
+import gleam/order
+import gleam/result
 
 import bencode/bencode
 import bencode/decode
+
+pub type Error {
+  DecodeError(bencode.DecodeError)
+  InvalidFile(msg: String, causes: List(decode.DecodeError))
+}
 
 pub type FileInfo {
   FileInfo(path: List(String), length: Int)
@@ -50,7 +56,19 @@ fn collect_piece_hashes(
   }
 }
 
-pub fn info_to_bencode(info: TorrentInfo) -> bencode.Value {
+pub fn info_hash(info: TorrentInfo) -> String {
+  let encoded = info_to_bencode(info) |> bencode.encode
+
+  let info_hash =
+    encoded
+    |> crypto.hash(crypto.Sha1, _)
+    // TODO: This is just for magnet links (which legacy used base32...), need to implement percent encoding
+    |> bit_array.base16_encode
+
+  info_hash
+}
+
+fn info_to_bencode(info: TorrentInfo) -> bencode.Value {
   let flat_pieces = info.pieces |> list.fold(<<>>, bit_array.append)
   case info {
     SingleFile(piece_length, _pieces, file) -> {
@@ -97,6 +115,19 @@ pub fn to_bencode(torrent: Torrent) -> bencode.Value {
   |> bencode.Dict
 }
 
+pub fn from_bits(bits: BitArray) -> Result(Torrent, Error) {
+  use bencode <- result.try(
+    bencode.decode(bits) |> result.map_error(DecodeError),
+  )
+
+  use torrent <- result.try(
+    from_bencode(bencode)
+    |> result.map_error(InvalidFile(msg: "parsing bencode", causes: _)),
+  )
+
+  Ok(torrent)
+}
+
 pub type Torrent {
   Torrent(
     announce: String,
@@ -108,88 +139,51 @@ pub type Torrent {
   )
 }
 
-pub type AnnounceRequest {
-  AnnounceRequest(
-    info_hash: String,
-    peer_id: String,
-    port: Int,
-    uploaded: Int,
-    downloaded: Int,
-    left: Int,
-    compact: Int,
-  )
+pub type FilePiece {
+  FilePiece(path: List(String), byte_offset: Int, length: Int)
 }
 
-pub fn new_announce_request(torrent_info: TorrentInfo) -> AnnounceRequest {
-  let encoded = info_to_bencode(torrent_info) |> bencode.encode
-  let info_hash =
-    encoded
-    |> crypto.hash(crypto.Sha1, _)
-    |> bit_array.base64_url_encode(True)
-    |> string.slice(0, 20)
+fn piece_map(
+  piece_len: Int,
+  piece_offset: Int,
+  piece_num: Int,
+  file_offset: Int,
+  files: List(FileInfo),
+  acc: List(#(List(String), Int, Int, Int)),
+) -> List(#(List(String), Int, Int, Int)) {
+  case files {
+    [] -> acc
+    [file, ..rest] -> {
+      let bytes_in_piece = piece_len - piece_offset
+      let next_offset = file_offset + bytes_in_piece
 
-  let peer_id =
-    crypto.strong_random_bytes(32)
-    |> bit_array.base64_url_encode(True)
-    |> string.slice(0, 20)
+      case int.compare(next_offset, file.length) {
+        // Piece ends at the end of this file
+        order.Eq -> {
+          let entry = #(file.path, piece_num, file_offset, bytes_in_piece)
+          piece_map(piece_len, 0, piece_num + 1, 0, rest, [entry, ..acc])
+        }
 
-  AnnounceRequest(
-    info_hash:,
-    peer_id:,
-    port: 6881,
-    uploaded: 0,
-    downloaded: 0,
-    left: 0,
-    compact: 1,
-  )
-}
+        // Piece ends in the middle of this file
+        order.Lt -> {
+          let entry = #(file.path, piece_num, file_offset, bytes_in_piece)
+          piece_map(piece_len, 0, piece_num + 1, next_offset, files, [
+            entry,
+            ..acc
+          ])
+        }
 
-pub type Piece {
-  Piece(path: List(String), hash: BitArray, byte_offset: Int, length: Int)
-}
-
-fn file_pieces(
-  piece_hashes piece_hashes: dict.Dict(Int, BitArray),
-  piece_length piece_length: Int,
-  path path: List(String),
-  length length: Int,
-  file_piece_index file_piece_index: Int,
-  piece_index piece_index: Int,
-  acc acc: List(Piece),
-) -> List(Piece) {
-  case length > piece_length {
-    True -> {
-      let assert Ok(hash) = dict.get(piece_hashes, piece_index)
-
-      let piece =
-        Piece(
-          path:,
-          hash:,
-          byte_offset: file_piece_index * piece_length,
-          length: piece_length,
-        )
-      file_pieces(
-        piece_hashes:,
-        piece_length:,
-        path:,
-        length: length - piece_length,
-        file_piece_index: file_piece_index + 1,
-        piece_index: piece_index + 1,
-        acc: [piece, ..acc],
-      )
-    }
-    False -> {
-      // Last piece of this file
-      let assert Ok(hash) = dict.get(piece_hashes, piece_index)
-
-      let piece =
-        Piece(
-          path:,
-          hash:,
-          byte_offset: file_piece_index * piece_length,
-          length:,
-        )
-      [piece, ..acc]
+        // Piece ends in next file
+        order.Gt -> {
+          let bytes_in_file = file.length - file_offset
+          let new_piece_offset = piece_offset + bytes_in_file
+          let entry = #(file.path, piece_num, file_offset, bytes_in_file)
+          piece_map(piece_len, new_piece_offset, piece_num, 0, rest, [
+            entry,
+            ..acc
+          ])
+        }
+      }
     }
   }
 }
@@ -198,29 +192,22 @@ fn create_piece_map(
   piece_length: Int,
   pieces: List(BitArray),
   files: List(FileInfo),
-) -> dict.Dict(Int, Piece) {
+) -> dict.Dict(Int, #(BitArray, List(FilePiece))) {
   let piece_hashes =
     list.index_map(pieces, fn(p, i) { #(i, p) }) |> dict.from_list
 
-  let pieces =
-    list.fold(files, [], fn(acc, file) {
-      file_pieces(
-        piece_hashes:,
-        piece_length:,
-        path: file.path,
-        length: file.length,
-        file_piece_index: 0,
-        piece_index: acc |> list.length,
-        acc:,
-      )
-    })
-    |> list.reverse
-    |> list.index_map(fn(p, i) { #(i, p) })
+  piece_map(piece_length, 0, 0, 0, files, [])
+  |> list.fold(dict.new(), fn(acc, p) {
+    let #(path, piece_num, offset, length) = p
+    let assert Ok(hash) = dict.get(piece_hashes, piece_num)
+    let #(hash, prev) = dict.get(acc, piece_num) |> result.unwrap(#(hash, []))
 
-  dict.from_list(pieces)
+    let piece_info = [FilePiece(path, offset, length), ..prev]
+    dict.insert(acc, piece_num, #(hash, piece_info))
+  })
 }
 
-pub fn piece_map(info: TorrentInfo) {
+pub fn get_piece_map(info: TorrentInfo) {
   case info {
     SingleFile(piece_length, pieces, file) ->
       create_piece_map(piece_length, pieces, [file])
