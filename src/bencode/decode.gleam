@@ -1,64 +1,74 @@
+import gleam/bit_array
 import gleam/bool
 import gleam/dict.{type Dict}
 import gleam/list
 import gleam/option
 import gleam/result
 
-import bencode/bencode.{type Value}
+import beencode.{type BValue}
 
 pub type DecodeError {
   DecodeError(expected: String, found: String)
 }
 
 pub opaque type Decoder(t) {
-  Decoder(function: fn(Value) -> #(t, List(DecodeError)))
+  Decoder(function: fn(BValue) -> #(t, List(DecodeError)))
 }
 
 pub fn success(data: t) -> Decoder(t) {
   Decoder(function: fn(_) { #(data, []) })
 }
 
+fn classify(value: BValue) {
+  case value {
+    beencode.BInt(_) -> "Int"
+    beencode.BString(_) -> "String"
+    beencode.BList(_) -> "List"
+    beencode.BDict(_) -> "Dict"
+  }
+}
+
 pub fn failure(zero: a, expected: String) -> Decoder(a) {
-  Decoder(function: fn(d) {
-    #(zero, [DecodeError(expected, bencode.classify(d))])
-  })
+  Decoder(function: fn(d) { #(zero, [DecodeError(expected, classify(d))]) })
 }
 
 pub const int: Decoder(Int) = Decoder(decode_int)
 
-fn decode_int(value: Value) -> #(Int, List(DecodeError)) {
+fn decode_int(value: BValue) -> #(Int, List(DecodeError)) {
   run_decode_function(value, "Int", do_decode_int)
 }
 
-fn do_decode_int(value: Value) {
+fn do_decode_int(value: BValue) {
   case value {
-    bencode.Int(num) -> Ok(num)
+    beencode.BInt(num) -> Ok(num)
     _ -> Error(0)
   }
 }
 
 pub const string: Decoder(String) = Decoder(decode_string)
 
-fn decode_string(value: Value) -> #(String, List(DecodeError)) {
+fn decode_string(value: BValue) -> #(String, List(DecodeError)) {
   run_decode_function(value, "String", do_decode_string)
 }
 
-fn do_decode_string(value: Value) {
+fn do_decode_string(value: BValue) {
   case value {
-    bencode.String(str) -> Ok(str)
+    beencode.BString(bytes) -> {
+      bytes |> bit_array.to_string |> result.replace_error("")
+    }
     _ -> Error("")
   }
 }
 
 pub const bytes: Decoder(BitArray) = Decoder(decode_bytes)
 
-fn decode_bytes(value: Value) -> #(BitArray, List(DecodeError)) {
+fn decode_bytes(value: BValue) -> #(BitArray, List(DecodeError)) {
   run_decode_function(value, "BitArray", do_decode_bytes)
 }
 
-fn do_decode_bytes(value: Value) {
+fn do_decode_bytes(value: BValue) {
   case value {
-    bencode.Bytes(bytes) -> Ok(bytes)
+    beencode.BString(bytes) -> Ok(bytes)
     _ -> Error(<<>>)
   }
 }
@@ -71,12 +81,12 @@ pub fn list(of inner: Decoder(t)) -> Decoder(List(t)) {
 }
 
 fn decode_list(
-  value: Value,
-  item: fn(Value) -> #(t, List(DecodeError)),
+  value: BValue,
+  item: fn(BValue) -> #(t, List(DecodeError)),
 ) -> #(List(t), List(DecodeError)) {
   let #(items, errors) = case value {
-    bencode.List(items) -> #(items, [])
-    _ -> #([], [DecodeError("List", bencode.classify(value))])
+    beencode.BList(items) -> #(items, [])
+    _ -> #([], [DecodeError("List", classify(value))])
   }
 
   list.map(items, item)
@@ -94,17 +104,17 @@ pub fn dict(key key: Decoder(a), value val: Decoder(b)) -> Decoder(Dict(a, b)) {
 }
 
 fn decode_dict(
-  value: Value,
-  key: fn(Value) -> #(k, List(DecodeError)),
-  val: fn(Value) -> #(v, List(DecodeError)),
+  value: BValue,
+  key: fn(BValue) -> #(k, List(DecodeError)),
+  val: fn(BValue) -> #(v, List(DecodeError)),
 ) -> #(Dict(k, v), List(DecodeError)) {
   let #(entries, errors) = case value {
-    bencode.Dict(entries) -> #(entries |> dict.to_list, [])
-    _ -> #([], [DecodeError("List", bencode.classify(value))])
+    beencode.BDict(entries) -> #(entries |> dict.to_list, [])
+    _ -> #([], [DecodeError("List", classify(value))])
   }
 
   list.map(entries, fn(entry) {
-    let #(k, kerr) = key(entry.0)
+    let #(k, kerr) = key(beencode.BString(entry.0))
     let #(v, verr) = val(entry.1)
 
     #(#(k, v), list.append(kerr, verr))
@@ -129,12 +139,12 @@ pub fn field(
 ) -> Decoder(final) {
   Decoder(fn(value) {
     let as_dict = case value {
-      bencode.Dict(d) -> Ok(d)
+      beencode.BDict(d) -> Ok(d)
       _ -> Error(Nil)
     }
 
     let #(out, errors1) = {
-      let val = result.then(as_dict, dict.get(_, bencode.String(key)))
+      let val = result.then(as_dict, dict.get(_, key |> bit_array.from_string))
       case val {
         Ok(val) -> inner.function(val)
         _ -> inner.function(value)
@@ -181,18 +191,18 @@ pub fn then(first: Decoder(t), do f: fn(t) -> Decoder(final)) -> Decoder(final) 
 }
 
 fn run_decode_function(
-  value: Value,
+  value: BValue,
   name: String,
-  f: fn(Value) -> Result(t, t),
+  f: fn(BValue) -> Result(t, t),
 ) -> #(t, List(DecodeError)) {
   case f(value) {
     Ok(data) -> #(data, [])
-    Error(default) -> #(default, [DecodeError(name, bencode.classify(value))])
+    Error(default) -> #(default, [DecodeError(name, classify(value))])
   }
 }
 
 fn run_decoders(
-  value: Value,
+  value: BValue,
   failure: #(t, List(DecodeError)),
   decoders: List(Decoder(t)),
 ) -> #(t, List(DecodeError)) {
@@ -209,7 +219,7 @@ fn run_decoders(
   }
 }
 
-pub fn run(value: Value, decoder: Decoder(t)) -> Result(t, List(DecodeError)) {
+pub fn run(value: BValue, decoder: Decoder(t)) -> Result(t, List(DecodeError)) {
   let #(maybe_invalid_data, errors) = decoder.function(value)
   case errors {
     [] -> Ok(maybe_invalid_data)

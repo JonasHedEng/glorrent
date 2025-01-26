@@ -6,11 +6,11 @@ import gleam/list
 import gleam/order
 import gleam/result
 
-import bencode/bencode
+import beencode.{type BValue}
 import bencode/decode
 
 pub type Error {
-  DecodeError(bencode.DecodeError)
+  DecodeError(beencode.BDecodeError)
   InvalidFile(msg: String, causes: List(decode.DecodeError))
 }
 
@@ -28,15 +28,17 @@ pub type TorrentInfo {
   )
 }
 
-fn multifile_info_to_bencode(file_info: FileInfo) -> bencode.Value {
+fn multifile_info_to_bencode(file_info: FileInfo) -> BValue {
   dict.from_list([
-    #("length" |> bencode.String, file_info.length |> bencode.Int),
+    #(<<"length">>, file_info.length |> beencode.BInt),
     #(
-      "path" |> bencode.String,
-      file_info.path |> list.map(bencode.String) |> bencode.List,
+      <<"path">>,
+      file_info.path
+        |> list.map(fn(s) { beencode.BString(<<s:utf8>>) })
+        |> beencode.BList,
     ),
   ])
-  |> bencode.Dict
+  |> beencode.BDict
 }
 
 fn collect_piece_hashes(
@@ -57,7 +59,7 @@ fn collect_piece_hashes(
 }
 
 pub fn info_hash(info: TorrentInfo) -> String {
-  let encoded = info_to_bencode(info) |> bencode.encode
+  let encoded = info_to_bencode(info) |> beencode.encode
 
   let info_hash =
     encoded
@@ -68,56 +70,58 @@ pub fn info_hash(info: TorrentInfo) -> String {
   info_hash
 }
 
-fn info_to_bencode(info: TorrentInfo) -> bencode.Value {
+fn info_to_bencode(info: TorrentInfo) -> BValue {
   let flat_pieces = info.pieces |> list.fold(<<>>, bit_array.append)
   case info {
     SingleFile(piece_length, _pieces, file) -> {
       let assert [name] = file.path
 
       dict.from_list([
-        #("name" |> bencode.String, name |> bencode.String),
-        #("length" |> bencode.String, file.length |> bencode.Int),
-        #("piece length" |> bencode.String, piece_length |> bencode.Int),
-        #("pieces" |> bencode.String, flat_pieces |> bencode.Bytes),
+        #(<<"name">>, <<name:utf8>> |> beencode.BString),
+        #(<<"length">>, file.length |> beencode.BInt),
+        #(<<"piece length">>, piece_length |> beencode.BInt),
+        #(<<"pieces">>, flat_pieces |> beencode.BString),
       ])
     }
     MultiFile(piece_length, _pieces, dir_name, files) -> {
       let files_list =
-        list.map(files, multifile_info_to_bencode) |> bencode.List
+        list.map(files, multifile_info_to_bencode) |> beencode.BList
 
       dict.from_list([
-        #("name" |> bencode.String, dir_name |> bencode.String),
-        #("files" |> bencode.String, files_list),
-        #("piece length" |> bencode.String, piece_length |> bencode.Int),
-        #("pieces" |> bencode.String, flat_pieces |> bencode.Bytes),
+        #(<<"name">>, <<dir_name:utf8>> |> beencode.BString),
+        #(<<"files">>, files_list),
+        #(<<"piece length">>, piece_length |> beencode.BInt),
+        #(<<"pieces">>, flat_pieces |> beencode.BString),
       ])
     }
   }
-  |> bencode.Dict
+  |> beencode.BDict
 }
 
-pub fn to_bencode(torrent: Torrent) -> bencode.Value {
+pub fn to_bencode(torrent: Torrent) -> BValue {
   dict.from_list([
-    #("announce" |> bencode.String, torrent.announce |> bencode.String),
+    #(<<"announce">>, <<torrent.announce:utf8>> |> beencode.BString),
     #(
-      "announce-list" |> bencode.String,
+      <<"announce-list">>,
       torrent.announce_list
         |> list.map(fn(inner) {
-          list.map(inner, bencode.String) |> bencode.List
+          list.map(inner, bit_array.from_string)
+          |> list.map(beencode.BString)
+          |> beencode.BList
         })
-        |> bencode.List,
+        |> beencode.BList,
     ),
-    #("comment" |> bencode.String, torrent.comment |> bencode.String),
-    #("created by" |> bencode.String, torrent.created_by |> bencode.String),
-    #("creation date" |> bencode.String, torrent.creation_date |> bencode.Int),
-    #("info" |> bencode.String, info_to_bencode(torrent.info)),
+    #(<<"comment">>, <<torrent.comment:utf8>> |> beencode.BString),
+    #(<<"created by">>, <<torrent.created_by:utf8>> |> beencode.BString),
+    #(<<"creation date">>, torrent.creation_date |> beencode.BInt),
+    #(<<"info">>, info_to_bencode(torrent.info)),
   ])
-  |> bencode.Dict
+  |> beencode.BDict
 }
 
 pub fn from_bits(bits: BitArray) -> Result(Torrent, Error) {
   use bencode <- result.try(
-    bencode.decode(bits) |> result.map_error(DecodeError),
+    beencode.decode(bits) |> result.map_error(DecodeError),
   )
 
   use torrent <- result.try(
@@ -216,9 +220,7 @@ pub fn get_piece_map(info: TorrentInfo) {
   }
 }
 
-pub fn from_bencode(
-  value: bencode.Value,
-) -> Result(Torrent, List(decode.DecodeError)) {
+pub fn from_bencode(value: BValue) -> Result(Torrent, List(decode.DecodeError)) {
   let decoder = {
     let info_decoder = {
       use piece_length <- decode.field("piece length", decode.int)

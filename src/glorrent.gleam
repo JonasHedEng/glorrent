@@ -26,7 +26,7 @@ pub fn main() {
   let assert Ok(stored_torrent) =
     process.call(torrent_table_actor, torrent_table.Get(hash, _), 10)
 
-  io.println(stored_torrent |> torrent.to_bencode |> bencode.pretty_format)
+  io.println(stored_torrent |> torrent.to_bencode |> bencode.pretty)
 
   // torrent
   // |> bencode.pretty_format
